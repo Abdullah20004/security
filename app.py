@@ -46,13 +46,13 @@ app.config['SECRET_KEY'] = os.getenv('SECRET_KEY')
 app.config['SESSION_COOKIE_SECURE'] = os.getenv('FLASK_ENV') == 'production'
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
-app.config['PERMANENT_SESSION_LIFETIME'] = 1800  # 30 minutes
+app.config['PERMANENT_SESSION_LIFETIME'] = 1800
 csrf = CSRFProtect(app)
 
 limiter = Limiter(
     app=app,
     key_func=get_remote_address,
-    default_limits=["50 per day", "6 per hour"],
+    default_limits=["50 per day", "15 per hour"],
     storage_uri="memory://"
 )
 # Disable HTTPS enforcement for local development
@@ -257,7 +257,7 @@ def index():
     return render_template('index.html')
 
 @app.route('/register', methods=['GET', 'POST'])
-@limiter.limit("5 per hour")
+@limiter.limit("15 per hour")
 def register():
     if current_user.is_authenticated:
         return redirect(url_for('index'))
@@ -265,6 +265,7 @@ def register():
     # Get current rate-limit status to show remaining attempts
     limit_info = None
     try:
+        # This triggers the limiter check and gives us the current state
         limiter.check()
         rv = limiter._storage.get(f"ratelimit/{request.endpoint}/{get_remote_address()}")
         if rv:
@@ -272,7 +273,7 @@ def register():
             reset_time = rv[2]
             limit_info = {
                 "remaining": remaining,
-                "total": 5,
+                "total": 15,
                 "reset_in": max(0, int(reset_time - datetime.utcnow().timestamp())) if reset_time else None
             }
     except Exception:
@@ -335,7 +336,7 @@ def register():
                 reset_time = rv[2]
                 limit_info = {
                     "remaining": remaining,
-                    "total": 5,
+                    "total": 15,
                     "reset_in": max(0, int(reset_time - datetime.utcnow().timestamp())) if reset_time else None
                 }
         except:
@@ -344,7 +345,7 @@ def register():
     return render_template('register.html', limit_info=limit_info)
 
 @app.route('/login', methods=['GET', 'POST'])
-@limiter.limit("5 per hour")
+@limiter.limit("15 per hour")
 def login():
     if current_user.is_authenticated:
         return redirect(url_for('index'))
@@ -391,6 +392,79 @@ def logout():
     return redirect(url_for('index'))
 
 # ============== ADMIN ROUTES ==============
+@app.route('/admin/manage_users')
+@login_required
+@role_required('admin')
+def manage_users():
+    conn = sqlite3.connect('database.db')
+    c = conn.cursor()
+    
+    # Get all users with their role-specific name if available
+    c.execute("""
+        SELECT u.id, u.username, u.role, u.email, u.created_at,
+               COALESCE(p.name, d.name, n.name, 'N/A') as display_name
+        FROM users u
+        LEFT JOIN patients p ON p.user_id = u.id
+        LEFT JOIN doctors d ON d.user_id = u.id
+        LEFT JOIN nurses n ON n.user_id = u.id
+        ORDER BY u.created_at DESC
+    """)
+    users = c.fetchall()
+    
+    conn.close()
+    
+    return render_template('admin/manage_users.html', users=users)
+
+@app.route('/admin/delete_user/<int:user_id>', methods=['POST'])
+@login_required
+@role_required('admin')
+def delete_user(user_id):
+    if user_id == current_user.id:
+        flash('You cannot delete your own account!', 'danger')
+        return redirect(url_for('manage_users'))
+    
+    conn = sqlite3.connect('database.db')
+    c = conn.cursor()
+    
+    # Get user info for logging
+    c.execute("SELECT username, role FROM users WHERE id = ?", (user_id,))
+    user = c.fetchone()
+    
+    if not user:
+        flash('User not found.', 'danger')
+        conn.close()
+        return redirect(url_for('manage_users'))
+    
+    username, role = user
+    
+    try:
+        # Delete role-specific record first
+        if role == 'patient':
+            c.execute("DELETE FROM patients WHERE user_id = ?", (user_id,))
+        elif role == 'doctor':
+            c.execute("DELETE FROM doctors WHERE user_id = ?", (user_id,))
+        elif role == 'nurse':
+            c.execute("DELETE FROM nurses WHERE user_id = ?", (user_id,))
+        
+        # Delete the user account
+        c.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        
+        conn.commit()
+        
+        # Log the deletion
+        log_audit(current_user.id, 'DELETE_USER', f'Deleted {role} account: {username} (ID: {user_id})', request.remote_addr)
+        
+        flash(f'{role.capitalize()} account "{username}" deleted successfully.', 'success')
+    
+    except Exception as e:
+        conn.rollback()
+        flash('Error deleting user. They may have associated records.', 'danger')
+    
+    finally:
+        conn.close()
+    
+    return redirect(url_for('manage_users'))
+
 @app.route('/admin/dashboard')
 @login_required
 @role_required('admin')
